@@ -1,0 +1,312 @@
+
+
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(patchwork)
+library(purrr)
+
+
+
+
+make_AP_plot_func(
+  "RFL_USPR",
+  "UNITIKA GLASS BEADS CO LTD",
+  "/apps/input_files/MAT/RFL/RFL_Inputs/2025-06-30/L3_AP/AP_LEDGER_TTM_CALC_DATA.csv",
+  "/apps/input_files/MAT/RFL/RFL_Inputs/2025-06-30/L3_AP",
+  "/apps/input_files/MAT/RFL/RFL_Inputs/2025-06-30/L3_AR/AP_SEGMENTS_0729.csv",
+  y_pretty_n        = 7,
+  y_pretty_padding  = 0.05,
+  width_px          = 900,
+  height_px         = 1200,
+  units             = "px",
+  dpi               = 100
+)
+
+
+make_AP_plot_func <- function(
+    target_entity,
+    target_account,
+    input_csv,
+    out_dir,
+    cv_csv,
+    y_pretty_n        = 5,
+    y_pretty_padding  = 0.05,
+    width_px          = 700,
+    height_px         = 1200,
+    units             = "px",
+    dpi               = 100
+) {
+  
+  # read the summary‐of‐CV file here
+  cv_df <- fread("/apps/input_files/MAT/RFL/RFL_Inputs/2025-06-30/L3_AR/AR_SUMMARY_0706.csv")
+  
+  # custom y-scale generator
+  y_pretty_fun <- function(n = y_pretty_n, data_vector = NULL, padding = y_pretty_padding) {
+    if (!is.null(data_vector)) {
+      mn <- min(data_vector, na.rm = TRUE); mx <- max(data_vector, na.rm = TRUE)
+      if (mn >= 0 && mx >= 0) {
+        lower <- min(0, mn * (1 - padding)); upper <- mx * (1 + padding)
+      } else if (mn < 0 && mx > 0) {
+        lower <- mn * (1 + padding); upper <- mx * (1 + padding)
+      } else {
+        lower <- mn * (1 + padding); upper <- max(0, mx * (1 - padding))
+      }
+      lims <- c(lower, upper)
+    } else {
+      lims <- NULL
+    }
+    scale_y_continuous(
+      position = "right",
+      labels   = label_comma(accuracy = 1),
+      breaks   = scales::breaks_extended(n = n),
+      limits   = lims,
+      oob      = scales::squish
+    )
+  }
+  
+  # read & prep data, include TARGET_DPO for p5
+  df <- fread(input_csv)[-1] %>%
+    filter(account_name == target_account, entity ==target_entity) %>%
+    transmute(
+      Date                = as.Date(date),
+      Balance             = round(as.numeric(calc_balance), 2),
+      Target_Balance      = round(as.numeric(TARGET_BALANCE), 2),
+      TTM_Debit           = round(as.numeric(TTM_CREDIT), 2),
+      TTM_DPO             = round(as.numeric(TTM_DPO), 2),
+      Target_DPO          = round(as.numeric(TARGET_DPO), 2),
+      debit               = as.numeric(debit),
+      credit              = as.numeric(credit),
+      Debit_Intermittency = if("Debit_Intermittency" %in% names(.)) Debit_Intermittency else NA,
+      Credit_Intermittency = if("Credit_Intermittency" %in% names(.)) Credit_Intermittency else NA,
+      Net_Balance         = Balance - Target_Balance,
+      over                = Balance > Target_Balance
+    ) %>%
+    arrange(Date) %>%
+    mutate(run = cumsum(over != lag(over, default = first(over))))
+  
+  # common scales & theme
+  date_scale <- scale_x_date(date_breaks = "1 year", date_labels = "%Y")
+  zero_line  <- geom_hline(yintercept = 0, colour = "grey30", size = 0.2)
+  line_scale <- scale_color_manual(
+    name   = NULL,
+    values = c(
+      "TTM Purchases"       = "#297A3F",
+      "TTM DPO"         = "#43799F",
+      "Actual Balance"  = "#CD3E43",
+      "Target Balance"  = "#2A7B43"
+    )
+  )
+  base_theme <- theme_minimal(base_family = "Times", base_size = 12) +
+    theme(
+      axis.title.x     = element_blank(),
+      plot.background  = element_rect(fill = "#f3cdb6", colour = NA),
+      panel.background = element_rect(fill = "#f3cdb6", colour = NA),
+      axis.line.y      = element_blank(),
+      axis.ticks       = element_blank(),
+      panel.grid.major = element_line(colour = "#e8a074", linetype = "dashed"),
+      panel.grid.minor = element_blank(),
+      plot.margin      = unit(c(15, 5, 15, 3), "pt")   # <-- instead of margin()
+    )
+  
+  # panels p1-p4 unchanged
+  p1 <- ggplot(df, aes(Date, TTM_Debit, color = "TTM Purchases")) +
+    zero_line + geom_line(size = 0.5) + line_scale + y_pretty_fun() + date_scale + base_theme +
+    theme(legend.position = "left",
+          panel.grid      = element_blank(),
+          axis.title.y.right = element_text(angle = 0, vjust = 0.5, hjust = 0.5, margin = margin(l = 5))) +
+    labs(y = "USD")
+  
+  
+
+  p2 <- ggplot(df, aes(Date, TTM_DPO, color = "TTM DPO")) +
+    zero_line + geom_line(size = 0.5) + line_scale + y_pretty_fun() + date_scale + base_theme +
+    theme(legend.position = "left",
+          panel.grid      = element_blank(),
+          axis.title.y.right = element_text(angle = 0, vjust = 0.5, hjust = 0.5, margin = margin(l = 5))) +
+    labs(y = "Days")
+  
+  
+  
+  p3 <- ggplot(df, aes(Date)) +
+    zero_line +
+    geom_ribbon(aes(ymin = ifelse(over, Target_Balance, Balance),
+                    ymax = ifelse(over, Balance, Target_Balance),
+                    fill = over, group = run),
+                alpha = 0.3, show.legend = FALSE) +
+    scale_fill_manual(values = c(`TRUE` = "#CD3E43", `FALSE` = "#2A7B43")) +
+    geom_line(aes(y = Balance, color = "Actual Balance"), size = 0.5) +
+    geom_line(aes(y = Target_Balance, color = "Target Balance"), size = 0.5) +
+    line_scale + y_pretty_fun() + date_scale + base_theme +
+    theme(legend.position = "left",
+          panel.grid      = element_blank(),
+          axis.title.y.right = element_text(angle = 0, vjust = 0.5, hjust = 0.5, margin = margin(l = 5))) +
+    labs(y = "USD")
+  p4 <- ggplot(df, aes(Date, Net_Balance, fill = Net_Balance > 0)) +
+    zero_line + 
+    geom_col() +
+    scale_fill_manual(
+      name   = NULL,
+      breaks = c("TRUE","FALSE"),                # <— force TRUE first
+      values = c(
+        "TRUE"  = "#CD3E43",                    # Gain colour
+        "FALSE" = "#2A7B43"                     # Leak colour
+      ),
+      labels = c("Leak","Gain")                 # <— matching order
+    ) +
+    y_pretty_fun(data_vector = df$Net_Balance) + 
+    date_scale + base_theme +
+    theme(
+      legend.position      = "left",
+      panel.grid           = element_blank(),
+      axis.title.y.right   = element_text(
+        angle  = 0, vjust = 0.5, hjust = 0.5, margin = margin(l = 5)
+      )
+    ) +
+    labs(y = "USD")
+  
+  # p5: density of TTM DPO with dynamic fill depending on median <= target
+  target_val <- unique(df$Target_DPO)
+  median_val <- median(df$TTM_DPO, na.rm = TRUE)
+  fill_color <- if (median_val <= target_val) "firebrick" else "forestgreen"
+  
+  p5 <- ggplot(df %>% filter(!is.na(TTM_DPO), is.finite(TTM_DPO)), aes(x = TTM_DPO)) +
+    geom_density(fill = fill_color, alpha = 0.5, na.rm = TRUE) +
+    geom_vline(aes(xintercept = target_val, colour = "Target DPO", linetype = "Target DPO"), size = 0.5) +
+    geom_vline(aes(xintercept = median_val, colour = "Median TTM DPO", linetype = "Median TTM DPO"), size = 0.5) +
+    scale_colour_manual(
+      values = c("Target DPO" = "forestgreen", "Median TTM DPO" = "firebrick"),
+      name   = NULL
+    ) +
+    scale_linetype_manual(
+      values = c("Target DPO" = "dashed", "Median TTM DPO" = "solid"),
+      name   = NULL
+    ) +
+    scale_y_continuous(
+      position = "right",
+      labels   = scales::percent_format(accuracy = 1)
+    ) +
+    labs(x = "TTM DPO (Days)", y = "TTM DPO\nFrequency\nDistribution") +
+    base_theme +
+    theme(
+      legend.position      = "left",
+      panel.grid           = element_blank(),
+      axis.title.y.right   = element_text(angle = 0, vjust = 0.5, hjust = 0.5, margin = margin(l = 5))
+    )
+  
+  
+  
+  
+  combined <- p1 / p2 / p3 / p4 / p5 +
+    plot_layout(ncol = 1, guides = "keep") &
+    theme(
+      # increase the gap between the axis ticks/labels and the right‐side title:
+      axis.title.y.right = element_text(
+        angle  = 0,
+        vjust  = 0.5,
+        hjust  = 0.5,
+        margin = margin(l = 20)    # ← bump this number up or down to taste
+      ),
+      
+      # (optional) tuck your legend neatly on the left with a bit of key–label spacing
+      legend.position  = "left",
+      legend.spacing.x = unit(0.2, "cm")
+    )
+  
+  combined_tight <- combined +
+    plot_annotation(
+      title = target_account,
+      theme = theme(
+        plot.title      = element_text(family = "Times", face = "bold", size = 16, hjust = 0.5),
+        plot.background = element_rect(fill = "#f3cdb6", color = NA)
+      )
+    )
+  
+  # render to file
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  out_file <- file.path(out_dir, paste0(gsub("[^[:alnum:] _.-]", "_", target_account), ".png"))
+  png(filename = out_file, width = width_px, height = height_px, units = units, res = dpi)
+  print(combined_tight)
+  dev.off()
+  
+  invisible(out_file)
+}
+
+
+
+# READ ME 
+# FORMAT OF THE AP_TS FILE IN "/apps/input_files/MAT/RFL/RFL_Inputs/2025-06-30/L3_AP/AP_LEDGER_TTM_CALC_DATA.csv"
+# > str(AP_TS)
+# 'data.frame':	456976 obs. of  33 variables:
+#   $ X                   : int  1 2 3 4 5 6 7 8 9 10 ...
+# $ entity              : chr  "RFL_USPR" "RFL_USPR" "RFL_USPR" "RFL_USPR" ...
+# $ account_number      : int  761412 761412 761412 761412 761412 761412 761412 761412 761412 761412 ...
+# $ date                : chr  "2023-09-08" "2023-09-09" "2023-09-10" "2023-09-11" ...
+# $ account_name        : chr  "1 STOP MATERIAL HANDLING INC" "1 STOP MATERIAL HANDLING INC" "1 STOP MATERIAL HANDLING INC" "1 STOP MATERIAL HANDLING INC" ...
+# $ category            : chr  "carry" "carry" "carry" "carry" ...
+# $ debit               : num  0 0 0 0 0 0 0 0 0 0 ...
+# $ credit              : num  0 0 0 0 0 0 0 0 0 0 ...
+# $ balance             : logi  NA NA NA NA NA NA ...
+# $ c_dbt               : num  111211 111211 111211 111211 111211 ...
+# $ c_crt               : num  111211 111211 111211 111211 111211 ...
+# $ c_balance           : num  0 0 0 0 0 0 0 0 0 0 ...
+# $ calc_balance        : num  0 0 0 0 0 0 0 0 0 0 ...
+# $ outstanding         : int  NA NA NA NA NA NA NA NA NA NA ...
+# $ po_number           : chr  NA NA NA NA ...
+# $ missing_balance     : logi  FALSE FALSE FALSE FALSE FALSE FALSE ...
+# $ balance_offset      : num  0 0 0 0 0 0 0 0 0 0 ...
+# $ row_count           : int  974 974 974 974 974 974 974 974 974 974 ...
+# $ date_diff           : int  996 996 996 996 996 996 996 996 996 996 ...
+# $ TTM_DEBIT           : num  111211 111211 111211 111211 111211 ...
+# $ TTM_CREDIT          : num  111211 109211 109211 109211 109211 ...
+# $ TARGET_DPO          : int  90 90 90 90 90 90 90 90 90 90 ...
+# $ TTM_TURNS           : num  Inf Inf Inf Inf Inf ...
+# $ TTM_DPO             : num  0 0 0 0 0 0 0 0 0 0 ...
+# $ TARGET_TURNS        : num  4.1 4.1 4.1 4.1 4.1 4.1 4.1 4.1 4.1 4.1 ...
+# $ TARGET_BALANCE      : num  -27125 -26637 -26637 -26637 -26637 ...
+# $ NET_BALANCE         : num  27125 26637 26637 26637 26637 ...
+# $ last_debit_flag     : chr  NA NA NA NA ...
+# $ prev_debit_date     : chr  NA NA NA NA ...
+# $ Debit_Intermittency : int  NA NA NA NA NA NA NA NA NA NA ...
+# $ last_credit_flag    : chr  NA NA NA NA ...
+# $ prev_credit_date    : chr  NA NA NA NA ...
+# $ Credit_Intermittency: int  NA NA NA NA NA NA NA NA NA NA ...
+# > 
+
+
+# FORMAT OF THE AP_SUMMARY FILE IN "/apps/input_files/MAT/RFL/RFL_Inputs/2025-06-30/L3_AP/AP_SEGMENTS_0729.csv"
+# 
+# > str(AP_SUMMARY)
+# 'data.frame':	112 obs. of  30 variables:
+#   $ X                     : int  1 2 3 4 5 6 7 8 9 10 ...
+# $ entity                : chr  "RFL_USPR" "RFL_USPR" "RFL_USPR" "RFL_USPR" ...
+# $ account_name          : chr  "6565 HOWARD TMG LLC C/O THE MISSNER GROUP" "A&W TRUST" "ACHILLES USA INC" "ACS AUXILIARIES GROUP INC" ...
+# $ SAMPLE_SIZE           : int  652 195 1698 1265 1743 4469 466 1457 1259 2842 ...
+# $ TARGET_DPO            : int  90 90 90 90 90 90 90 90 90 90 ...
+# $ NONZERO_DEBIT_CT      : int  15 7 342 42 382 1702 18 215 59 959 ...
+# $ NONZERO_CREDIT_CT     : int  17 7 350 56 425 2076 15 217 65 987 ...
+# $ NONZERO_TXN_CT        : int  32 14 692 98 807 3778 33 432 124 1946 ...
+# $ OV_AMOUNT             : num  0.978 1 0.98 0.987 0.968 ...
+# $ OV_INTERMITTENCY      : num  0.609 0.897 0.889 0.687 0.605 ...
+# $ MEAN_TTM_DPO          : num  7.74 3.29 53.62 61.11 84.51 ...
+# $ SD_TTM_DPO            : num  13.9 11.3 17.7 97.9 72.6 ...
+# $ SKEW_TTM_DPO          : num  1.337 3.36 0.238 1.464 1.418 ...
+# $ KURT_TTM_DPO          : num  -0.0271 10.0708 0.2148 0.7045 1.9427 ...
+# $ OV_GM                 : num  0.772 0.947 0.934 0.824 0.766 ...
+# $ CV                    : num  1.789 3.444 0.331 1.603 0.86 ...
+# $ TTM_CREDIT_LAST       : num  145612 74370 874272 50644 218398 ...
+# $ TTM_DPO_LAST          : num  0 0 66.4 93.6 52.1 ...
+# $ TTM_DPO_SLOPE         : num  -0.1 0 0.1 -0.1 0 0.3 0.2 0.3 -0.2 0 ...
+# $ TTM_CREDIT_SLOPE      : num  -1471.8 174 -153.7 2.5 -368.3 ...
+# $ TTM_CREDIT_LAST_ntile : num  0.38739 0.16216 0.79279 0.00901 0.51351 ...
+# $ TTM_CREDIT_SLOPE_ntile: num  0.045 0.631 0.234 0.405 0.126 ...
+# $ TTM_DPO_LAST_ntile    : num  0 0 0.667 0.811 0.613 ...
+# $ TTM_DPO_SLOPE_ntile   : num  0.198 0.297 0.604 0.198 0.297 ...
+# $ CV_ntile              : num  0.731 0.944 0.139 0.694 0.435 ...
+# $ SIZE_SEGMENT          : chr  "Mid 40 percentile" "Lower 20 percentile" "Second 20 percentile" "Lowest 10 percentile" ...
+# $ CREDIT_SLOPE_SEGMENT  : chr  "Moderate Decline" "Moderate Growth" "Stable" "Stable" ...
+# $ DPO_SEGMENT           : chr  "Critical" "Critical" "Tight" "Beats Target" ...
+# $ DPO_SLOPE_SEGMENT     : chr  "Stable" "Stable" "Moderate Improvement" "Stable" ...
+# $ CV_SEGMENT            : chr  "Run away" "Wild" "Loose" "Ad hoc" ...
+# 
