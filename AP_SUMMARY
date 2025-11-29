@@ -1,0 +1,256 @@
+####### AP SUMMARY CV ####### ####### ####### ####### ####### ####### ####### ####### ####### ####### ####### ####### ####### ####### ####### #
+
+library(overlapping)
+library(e1071)
+library(dplyr)
+
+AP_LEDGER_TTM_CALC_DATA<-read.csv("/apps/input_files/MAT/RFL/RFL_Inputs/2025-06-30/L3_AP/AP_LEDGER_TTM_CALC_DATA.csv")[-1]
+
+
+alignment_df <- AP_LEDGER_TTM_CALC_DATA %>%
+  select(
+    entity,
+    account_number,
+    account_name,
+    type,
+    date,
+    debit,
+    credit,
+    calc_balance,
+    Debit_Intermittency,
+    Credit_Intermittency,
+    TTM_DEBIT,
+    TTM_CREDIT,
+    TTM_DPO
+  )
+
+
+###### STAT FEATURES #### ##### ##### ######### ##### ##### ##### ##### #####
+
+safe_ov   <- function(x, y) {          # unchanged
+  x <- na.omit(x); y <- na.omit(y)
+  if (length(x) >= 2 && length(y) >= 2) overlap(list(x, y))$OV else NA_real_
+}
+
+safe_skew <- function(x) {             # ≥ 3 obs
+  x <- na.omit(x)
+  if (length(x) >= 3) skewness(x, type = 2) else NA_real_
+}
+
+safe_kurt <- function(x) {             # ≥ 4 obs
+  x <- na.omit(x)
+  if (length(x) >= 4) kurtosis(x, type = 2) else NA_real_
+}
+
+
+alignment_df <- alignment_df %>%
+  mutate(date = as.Date(date, "%Y-%m-%d"))
+
+
+# now date is class "Date" and as.numeric(date) works
+summary_df <- alignment_df %>% 
+  group_by(entity, account_name) %>% 
+  summarise(
+    SAMPLE_SIZE      = n(),
+    TARGET_DPO       = first(na.omit(TARGET_DPO)),
+    NONZERO_DEBIT_CT = sum(debit  != 0, na.rm = TRUE),
+    NONZERO_CREDIT_CT= sum(credit != 0, na.rm = TRUE),
+    NONZERO_TXN_CT   = NONZERO_DEBIT_CT + NONZERO_CREDIT_CT,
+    OV_AMOUNT        = safe_ov(debit, credit),
+    OV_INTERMITTENCY = safe_ov(Debit_Intermittency, Credit_Intermittency),
+    MEAN_TTM_DPO     = mean(TTM_DPO, na.rm = TRUE),
+    SD_TTM_DPO       = sd(TTM_DPO,   na.rm = TRUE),
+    SKEW_TTM_DPO     = safe_skew(TTM_DPO),
+    KURT_TTM_DPO     = safe_kurt(TTM_DPO),
+    OV_GM            = sqrt(OV_INTERMITTENCY * OV_AMOUNT),
+    CV               = SD_TTM_DPO / abs(MEAN_TTM_DPO),
+    
+    # last observed TTM_DEBIT
+    TTM_CREDIT_LAST = {
+      df_last <- pick(TTM_CREDIT, date) %>% 
+        filter(!is.na(TTM_CREDIT), !is.na(date), is.finite(TTM_CREDIT)) %>% 
+        arrange(date)
+      if (nrow(df_last) > 0) last(df_last$TTM_CREDIT) else NA_real_
+    },
+    
+    TTM_DEBIT_LAST = {
+      df_last <- pick(TTM_DEBIT, date) %>% 
+        filter(!is.na(TTM_DEBIT), !is.na(date), is.finite(TTM_DEBIT)) %>% 
+        arrange(date)
+      if (nrow(df_last) > 0) last(df_last$TTM_DEBIT) else NA_real_
+    },
+    
+    BALANCE_LAST = {
+      df_last <- pick(TTM_CREDIT, date) %>% 
+        filter(!is.na(TTM_CREDIT), !is.na(date), is.finite(TTM_CREDIT)) %>% 
+        arrange(date)
+      if (nrow(df_last) > 0) last(df_last$TTM_CREDIT) else NA_real_
+    },
+    
+    # last observed TTM_DEBIT
+    TTM_DPO_LAST = {
+      df_last <- pick(TTM_DPO, date) %>% 
+        filter(!is.na(TTM_DPO), !is.na(date), is.finite(TTM_DPO)) %>% 
+        arrange(date)
+      if (nrow(df_last) > 0) last(df_last$TTM_DPO) else NA_real_
+    },
+    
+    # slopes over the last 270 *valid* rows
+    TTM_DPO_SLOPE = {
+      df_ts <- pick(TTM_DPO, date) %>% 
+        filter(!is.na(TTM_DPO), !is.na(date), is.finite(TTM_DPO)) %>% 
+        arrange(date)
+      if (nrow(df_ts) >= 2) {
+        window <- slice_tail(df_ts, n = min(nrow(df_ts), 270))
+        coef(lm(TTM_DPO ~ as.numeric(date), data = window))[2]
+      } else {
+        NA_real_
+      }
+    },
+    
+    TTM_CREDIT_SLOPE = {
+      df_cr <- pick(TTM_CREDIT, date) %>% 
+        filter(!is.na(TTM_CREDIT), !is.na(date), is.finite(TTM_CREDIT)) %>% 
+        arrange(date)
+      if (nrow(df_cr) >= 2) {
+        window <- slice_tail(df_cr, n = min(nrow(df_cr), 270))
+        coef(lm(TTM_CREDIT ~ as.numeric(date), data = window))[2]
+      } else {
+        NA_real_
+      }
+    },
+    
+    .groups = "drop"
+  )
+
+summary_df$TTM_CREDIT_SLOPE<-round(summary_df$TTM_CREDIT_SLOPE,1)
+summary_df$TTM_DPO_SLOPE<-round(summary_df$TTM_DPO_SLOPE,1)
+
+write.csv(summary_df,"/apps/input_files/MAT/RFL/RFL_Inputs/2025-06-30/L3_AP/AP_SUMMARY_0725.csv")
+
+
+####### ###### ####### ####### ###### ############## ###### ####### ####### ###### ############## ###### #######
+# SEGMENTATION ######
+
+AP_SUMMARY_DF<-read.csv("/apps/input_files/MAT/RFL/RFL_Inputs/2025-06-30/L3_AP/AP_SUMMARY_0725.csv")[-1]
+
+
+AP_SUMMARY_DF <- AP_SUMMARY_DF %>%
+  filter(TTM_CREDIT_LAST >= 50000)
+
+
+AP_SUMMARY_DF <- AP_SUMMARY_DF %>%
+  mutate(
+    TTM_CREDIT_LAST_ntile    = percent_rank(TTM_CREDIT_LAST),
+    TTM_CREDIT_SLOPE_ntile   = percent_rank(TTM_CREDIT_SLOPE),
+    TTM_DPO_LAST_ntile       = percent_rank(TTM_DPO_LAST),
+    TTM_DPO_SLOPE_ntile      = percent_rank(TTM_DPO_SLOPE),
+    CV_ntile                 = percent_rank(CV)
+  )
+
+
+##### ##### SEGMENTS OF TTM_CREDIT_LAST ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### #####
+
+AP_SUMMARY_DF <- AP_SUMMARY_DF %>%
+  mutate(
+    SIZE_SEGMENT = case_when(
+      TTM_CREDIT_LAST_ntile <= 0.10                                  ~ "Lowest 10 percentile",
+      TTM_CREDIT_LAST_ntile > 0.10 & TTM_CREDIT_LAST_ntile <= 0.30   ~ "Lower 20 percentile",
+      TTM_CREDIT_LAST_ntile > 0.30 & TTM_CREDIT_LAST_ntile <= 0.70   ~ "Mid 40 percentile",
+      TTM_CREDIT_LAST_ntile > 0.70 & TTM_CREDIT_LAST_ntile <= 0.90   ~ "Second 20 percentile",
+      TTM_CREDIT_LAST_ntile > 0.90                                   ~ "Top 10 percentile",
+      TRUE                                                           ~ NA_character_
+    )
+  )
+
+##### ##### SEGMENTS OF TTM_CREDIT_SLOPE ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### #####
+
+mid_credit_slope <- AP_SUMMARY_DF %>%
+  filter(!is.na(TTM_CREDIT_SLOPE), !is.na(TTM_CREDIT_SLOPE_ntile)) %>%
+  arrange(abs(TTM_CREDIT_SLOPE)) %>%
+  slice(1) %>%
+  pull(TTM_CREDIT_SLOPE_ntile)
+
+
+make_credit_slope_segments <- function(df, ntile_col, mid) {
+  df %>% mutate(
+    CREDIT_SLOPE_SEGMENT = case_when(
+      !!sym(ntile_col) <= mid - 0.42                            ~ "Strong Decline",
+      !!sym(ntile_col) >  mid - 0.42 & !!sym(ntile_col) <= mid - 0.20 ~ "Moderate Decline",
+      !!sym(ntile_col) >  mid - 0.20 & !!sym(ntile_col) <= mid + 0.20 ~ "Stable",
+      !!sym(ntile_col) >  mid + 0.20 & !!sym(ntile_col) <= mid + 0.42 ~ "Moderate Growth",
+      !!sym(ntile_col) >  mid + 0.42                            ~ "Strong Growth",
+      TRUE                                                      ~ NA_character_
+    )
+  )
+}
+
+AP_SUMMARY_DF <- AP_SUMMARY_DF %>%
+  make_credit_slope_segments("TTM_CREDIT_SLOPE_ntile", mid_credit_slope)
+
+
+##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### #####  ##### ##### ##### ##### ##### #####
+
+##### ##### SEGMENTS OF TTM_DPO_LAST ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### #####
+
+AP_SUMMARY_DF <- AP_SUMMARY_DF %>%
+  mutate(
+    DPO_SEGMENT = case_when(
+      TTM_DPO_LAST >=  120                          ~ "Excellent",
+      TTM_DPO_LAST >=  90 & TTM_DPO_LAST <  120     ~ "Beats Target",
+      TTM_DPO_LAST >=  75 & TTM_DPO_LAST <  90      ~ "Off target",
+      TTM_DPO_LAST >=  30 & TTM_DPO_LAST <  75      ~ "Tight",
+      TTM_DPO_LAST <   30                           ~ "Critical",
+      TRUE                                          ~ NA_character_
+    )
+  )
+
+
+##### ##### ##### #####  ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ######
+
+##### ##### SEGMENTS OF TTM_DPO_SLOPE ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### #####
+
+mid_dpo_ntile <- AP_SUMMARY_DF %>%
+  filter(!is.na(TTM_DPO_SLOPE), !is.na(TTM_DPO_SLOPE_ntile)) %>%
+  # compute distance from 90, then sort so the closest comes first
+  arrange(abs(TTM_DPO_SLOPE)) %>%
+  slice(1) %>%
+  pull(TTM_DPO_SLOPE_ntile)
+
+
+make_dpo_slope_segments <- function(df, ntile_col, mid) {
+  df %>% mutate(
+    DPO_SLOPE_SEGMENT = case_when(
+      !!sym(ntile_col) <= mid - 0.20                            ~ "Strong Deterioration",
+      !!sym(ntile_col) >  mid - 0.20 & !!sym(ntile_col) <= mid - 0.10 ~ "Moderate Deterioration",
+      !!sym(ntile_col) >  mid - 0.10 & !!sym(ntile_col) <= mid + 0.10 ~ "Stable",
+      !!sym(ntile_col) >  mid + 0.10 & !!sym(ntile_col) <= mid + 0.35 ~ "Moderate Improvement",
+      !!sym(ntile_col) >  mid + 0.35                            ~ "Strong Improvement",
+      TRUE                                                      ~ NA_character_
+    )
+  )
+}
+
+AP_SUMMARY_DF <- AP_SUMMARY_DF %>%
+  make_dpo_slope_segments("TTM_DPO_SLOPE_ntile", mid_dpo_ntile)
+
+
+#### CV SEGMENTS ##### 
+
+AP_SUMMARY_DF <- AP_SUMMARY_DF %>%
+  mutate(
+    CV_SEGMENT = case_when(
+      CV_ntile <= 0.10                     ~ "Stable",
+      CV_ntile > 0.10 & CV_ntile <= 0.30   ~ "Loose",
+      CV_ntile > 0.30 & CV_ntile <= 0.70   ~ "Ad hoc",
+      CV_ntile > 0.70 & CV_ntile <= 0.90   ~ "Run away",
+      CV_ntile > 0.90                      ~ "Wild",
+      TRUE                                 ~ NA_character_
+    )
+  )
+
+######
+write.csv(AP_SUMMARY_DF,"/apps/input_files/MAT/RFL/RFL_Inputs/2025-06-30/L3_AP/AP_SEGMENTS_0729.csv")
+
+
+hist(AP_SUMMARY_DF$TTM_DPO_LAST)
