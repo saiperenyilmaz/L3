@@ -1,0 +1,367 @@
+library(overlapping)
+library(e1071)
+
+
+AR_TS_XP2_filtered<-read.csv("/apps/input_files/MAT/RFL/RFL_Inputs/2025-06-30/L3_AR/AR_TS_FINAL_0706.csv")[-1]
+
+alignment_df <- AR_TS_XP2_filtered %>%
+  select(
+    entity,
+    account_name,
+    date,
+    debit,
+    Debit_Intermittency,
+    credit,
+    Credit_Intermittency,
+    TTM_DSO,
+    TTM_DEBIT,
+    TARGET_DSO
+  )
+
+###### STAT FEATURES #### ##### ##### ######### ##### ##### ##### ##### #####
+
+safe_ov   <- function(x, y) {          # unchanged
+  x <- na.omit(x); y <- na.omit(y)
+  if (length(x) >= 2 && length(y) >= 2) overlap(list(x, y))$OV else NA_real_
+}
+
+safe_skew <- function(x) {             # ≥ 3 obs
+  x <- na.omit(x)
+  if (length(x) >= 3) skewness(x, type = 2) else NA_real_
+}
+
+safe_kurt <- function(x) {             # ≥ 4 obs
+  x <- na.omit(x)
+  if (length(x) >= 4) kurtosis(x, type = 2) else NA_real_
+}
+
+str(alignment_df)
+library(dplyr)
+
+alignment_df <- alignment_df %>%
+  mutate(date = as.Date(date, "%Y-%m-%d"))
+
+
+# now date is class "Date" and as.numeric(date) works
+summary_df <- alignment_df %>% 
+  group_by(entity, account_name) %>% 
+  summarise(
+    SAMPLE_SIZE      = n(),
+    TARGET_DSO       = first(na.omit(TARGET_DSO)),
+    NONZERO_DEBIT_CT = sum(debit  != 0, na.rm = TRUE),
+    NONZERO_CREDIT_CT= sum(credit != 0, na.rm = TRUE),
+    NONZERO_TXN_CT   = NONZERO_DEBIT_CT + NONZERO_CREDIT_CT,
+    OV_AMOUNT        = safe_ov(debit, credit),
+    OV_INTERMITTENCY = safe_ov(Debit_Intermittency, Credit_Intermittency),
+    MEAN_TTM_DSO     = mean(TTM_DSO, na.rm = TRUE),
+    SD_TTM_DSO       = sd(TTM_DSO,   na.rm = TRUE),
+    SKEW_TTM_DSO     = safe_skew(TTM_DSO),
+    KURT_TTM_DSO     = safe_kurt(TTM_DSO),
+    OV_GM            = sqrt(OV_INTERMITTENCY * OV_AMOUNT),
+    CV               = SD_TTM_DSO / abs(MEAN_TTM_DSO),
+    
+    # last observed TTM_DEBIT
+    TTM_DEBIT_LAST = {
+      df_last <- pick(TTM_DEBIT, date) %>% 
+        filter(!is.na(TTM_DEBIT), !is.na(date), is.finite(TTM_DEBIT)) %>% 
+        arrange(date)
+      if (nrow(df_last) > 0) last(df_last$TTM_DEBIT) else NA_real_
+    },
+    
+    # last observed TTM_DEBIT
+    TTM_DSO_LAST = {
+      df_last <- pick(TTM_DSO, date) %>% 
+        filter(!is.na(TTM_DSO), !is.na(date), is.finite(TTM_DSO)) %>% 
+        arrange(date)
+      if (nrow(df_last) > 0) last(df_last$TTM_DSO) else NA_real_
+    },
+    
+    # slopes over the last 270 *valid* rows
+    TTM_DSO_SLOPE = {
+      df_ts <- pick(TTM_DSO, date) %>% 
+        filter(!is.na(TTM_DSO), !is.na(date), 
+               is.finite(TTM_DSO)) %>%  # Add check for finite values
+        arrange(date)
+      if (nrow(df_ts) >= 270) {
+        last270 <- slice_tail(df_ts, n = 270)
+        # Use tryCatch to handle any remaining edge cases
+        tryCatch({
+          coef(lm(TTM_DSO ~ as.numeric(date), data = last270))[2]
+        }, error = function(e) NA_real_)
+      } else NA_real_
+    },
+    
+    TTM_DEBIT_SLOPE = {
+      df_db <- pick(TTM_DEBIT, date) %>% 
+        filter(!is.na(TTM_DEBIT), !is.na(date),
+               is.finite(TTM_DEBIT)) %>%  # Add check for finite values
+        arrange(date)
+      if (nrow(df_db) >= 270) {
+        last270 <- slice_tail(df_db, n = 270)
+        # Use tryCatch to handle any remaining edge cases
+        tryCatch({
+          coef(lm(TTM_DEBIT ~ as.numeric(date), data = last270))[2]
+        }, error = function(e) NA_real_)
+      } else NA_real_
+    },
+    
+    .groups = "drop"
+  )
+
+summary_df$TTM_DEBIT_SLOPE<-round(summary_df$TTM_DEBIT_SLOPE,1)
+summary_df$TTM_DSO_SLOPE<-round(summary_df$TTM_DSO_SLOPE,1)
+
+
+# FILTER BY SIZE
+
+setDT(summary_df)
+summary_df<-summary_df[TTM_DEBIT_LAST > 24000]
+
+summary_df <- summary_df %>%
+  filter(!is.na(TTM_DSO_SLOPE),
+         !is.na(TTM_DEBIT_SLOPE))
+
+# SIZE SEGMENTS
+
+summary_df <- summary_df %>%
+  mutate(
+    # compute 0–100 percentile of each TTM_DEBIT_LAST
+    TTM_DEBIT_LAST_PCT = percent_rank(TTM_DEBIT_LAST) * 100,
+    # bucket into your five segments
+    SIZE_SEGMENT = case_when(
+      TTM_DEBIT_LAST_PCT >  90 ~ "Top 10 percentile",
+      TTM_DEBIT_LAST_PCT >  70 ~ "Second 20 percentile",
+      TTM_DEBIT_LAST_PCT >  30 ~ "Mid 40 percentile",
+      TTM_DEBIT_LAST_PCT >  10 ~ "Lower 20 percentile",
+      TRUE                     ~ "Lowest 10 percentile"
+    )
+  ) %>%
+  select(-TTM_DEBIT_LAST_PCT) 
+
+
+# GROWTH TRENDS
+
+
+# 1) compute each debit‐slope’s percentile (0–100)
+summary_df <- summary_df %>%
+  mutate(
+    TTM_DEBIT_SLOPE_PCT = percent_rank(TTM_DEBIT_SLOPE) * 100
+  )
+
+# 2) find the percentile corresponding to exactly 0 slope
+ecdf_debit   <- ecdf(summary_df$TTM_DEBIT_SLOPE)
+pct0_debit   <- ecdf_debit(0) * 100
+
+# 3) define a ±20‐point “Stable” band around that zero‐percentile
+mid_lower_d  <- pct0_debit - 20
+mid_upper_d  <- pct0_debit + 20
+
+# 4) split the lower tail (0 → mid_lower_d) into 1∕3 & 2∕3
+lower_range_d  <- mid_lower_d
+break_lowest_d <- lower_range_d / 3
+
+# 5) split the upper tail (mid_upper_d → 100) into 2∕3 & 1∕3
+upper_range_d  <- 100 - mid_upper_d
+break_second_d <- mid_upper_d + (upper_range_d * 2/3)
+
+# 6) assemble breaks & human‐friendly labels
+breaks_debit <- c(-Inf,
+                  break_lowest_d,
+                  mid_lower_d,
+                  mid_upper_d,
+                  break_second_d,
+                  Inf)
+
+labels_debit <- c(
+  "Strong Decline",    # worst ~1∕3 of the negative tail
+  "Moderate Decline",  # remaining 2∕3 of the negative tail
+  "Stable",            # ±20 points around zero
+  "Moderate Growth",   # inner 2∕3 of the positive tail
+  "Strong Growth"      # top 1∕3 of the positive tail
+)
+
+# 7) cut into your five‐level factor and drop the helper pct col
+summary_df <- summary_df %>%
+  mutate(
+    DEBIT_SLOPE_SEGMENT = cut(
+      TTM_DEBIT_SLOPE_PCT,
+      breaks = breaks_debit,
+      labels = labels_debit,
+      include.lowest = TRUE
+    )
+  ) %>%
+  select(-TTM_DEBIT_SLOPE_PCT)
+
+
+# DSO SEGMENTS
+
+summary_df <- summary_df %>%
+  mutate(
+    # compute 0–100 percentile of each TTM_DSO_LAST
+    TTM_DSO_LAST_PCT = percent_rank(TTM_DSO_LAST) * 100,
+    
+    # assign professional labels
+    DSO_SEGMENT = case_when(
+      TTM_DSO_LAST_PCT <= 10  ~ "Fastest",    # fastest 10%
+      TTM_DSO_LAST_PCT <= 30  ~ "Good",     # next 20%
+      TTM_DSO_LAST_PCT <= 70  ~ "Average",     # middle 40%
+      TTM_DSO_LAST_PCT <= 90  ~ "Slow",    # next 20%
+      TRUE                    ~ "Critical" # slowest 10%
+    )
+  ) %>%
+  select(-TTM_DSO_LAST_PCT)
+
+
+# DSO TRENDS
+
+# 1) compute each slope’s percentile (0–100)
+summary_df <- summary_df %>%
+  mutate(
+    TTM_DSO_SLOPE_PCT = percent_rank(TTM_DSO_SLOPE) * 100
+  )
+
+# 2) find the global percentile that corresponds to a slope of exactly zero
+ecdf_fun   <- ecdf(summary_df$TTM_DSO_SLOPE)
+pct_at_zero <- ecdf_fun(0) * 100
+
+# 3) set up the “mid” window around zero (±20 points)
+mid_lower    <- pct_at_zero - 20
+mid_upper    <- pct_at_zero + 20
+
+# 4) split the remaining lower range (0 → mid_lower) into 1∕3 & 2∕3
+lower_range    <- mid_lower      # length of the “below mid” region
+break_lowest   <- lower_range / 3
+
+# 5) split the remaining upper range (mid_upper → 100) into 2∕3 & 1∕3
+upper_range    <- 100 - mid_upper
+break_second   <- mid_upper + (upper_range * 2/3)
+
+# 6) build your cuts & labels
+breaks <- c(-Inf,
+            break_lowest,
+            mid_lower,
+            mid_upper,
+            break_second,
+            Inf)
+
+labels <- c(
+  "Strong Improvement",      
+  "Moderate Improvement",   
+  "Stable",   # ±20 pts around zero
+  "Moderate Deterioration",
+  "Strong Deterioration"   
+)
+
+# 7) apply it
+summary_df <- summary_df %>%
+  mutate(
+    DSO_SLOPE_SEGMENT = cut(
+      TTM_DSO_SLOPE_PCT,
+      breaks = breaks,
+      labels = labels,
+      include.lowest = TRUE
+    )
+  ) %>%
+  select(-TTM_DSO_SLOPE_PCT)
+
+# CV SEGMENTS
+
+summary_df <- summary_df %>%
+  mutate(
+    CV_PCT = percent_rank(CV) * 100,
+    CV_SEGMENT = case_when(
+      CV_PCT >  90 ~ "Unpredictable",
+      CV_PCT >  70 ~ "High Variability",
+      CV_PCT >  30 ~ "Moderate Variability",
+      CV_PCT >  10 ~ "Low Variability",
+      TRUE         ~ "Consistent"
+    )
+  ) %>% select(-CV_PCT)
+
+
+
+write.csv(summary_df,"/apps/input_files/MAT/RFL/RFL_Inputs/2025-06-30/L3_AR/AR_SUMMARY_0707.csv")
+
+
+
+selected_df <- summary_df[
+  , c("entity",
+      "account_name",
+      "SIZE_SEGMENT",
+      "DEBIT_SLOPE_SEGMENT",
+      "DSO_SEGMENT",
+      "DSO_SLOPE_SEGMENT",
+      "CV_SEGMENT")
+]
+
+
+write.csv(selected_df,"/apps/input_files/MAT/RFL/RFL_Inputs/2025-06-30/L3_AR/Segment_List_0708.csv")
+
+clean_segment_sheet<-read.csv("/apps/input_files/MAT/RFL/RFL_Inputs/2025-06-30/L3_AR/My_Segment_Sheet.csv")
+clean_segment_sheet<-clean_segment_sheet[,c(1:11)]
+
+
+str(clean_segment_sheet)
+
+
+str(summary_df)
+
+
+#Prep the keys so they really match
+library(dplyr)   
+library(data.table)
+clean_segment_df <- clean_segment_sheet |>
+  mutate(
+    ENTITY   = trimws(ENTITY),
+    CUSTOMER = trimws(CUSTOMER)
+  ) |>
+  rename(
+    entity       = ENTITY,      # ⟵ matches summary_df
+    account_name = CUSTOMER
+  )
+
+setDT(clean_segment_df)        # not clean_segment_sheet
+setDT(summary_df)
+
+setkey(summary_df, entity, account_name)
+
+joined_dt <- summary_df[clean_segment_df, on = .(entity, account_name)]
+
+
+AR_TS_XP2_filtered_last <- AR_TS_XP2_filtered %>% 
+  mutate(date = as.Date(date)) %>%        # ensure proper Date class
+  group_by(entity, account_name) %>% 
+  slice_max(order_by = date, n = 1, with_ties = FALSE) %>% 
+  ungroup()
+
+
+
+summary_df <- summary_df %>%                       # overwrite or create new object
+  left_join(AR_TS_XP2_filtered_last, by = c("entity", "account_name")) %>% 
+  relocate(calc_balance, .after = TTM_DSO_LAST)    # optional: place it where you like
+
+
+
+
+
+
+library(dplyr)
+library(ggplot2)
+library(scales)   # for comma()
+
+top20_gap <- summary_df %>% 
+  slice_max(order_by = COLLECTION_GAP, n = 20, with_ties = FALSE) %>% 
+  mutate(account_name = factor(account_name, levels = account_name[order(COLLECTION_GAP)]))
+
+ggplot(top20_gap, aes(account_name, COLLECTION_GAP)) +
+  geom_col(width = 0.7, fill = "steelblue") +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Top 20 Collection Gaps by Customer",
+       x = NULL,
+       y = "Collection Gap (US$)") +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(hjust = 1)
+  )
